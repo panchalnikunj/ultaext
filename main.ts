@@ -1,135 +1,80 @@
 //% color=#00A6ED icon="\uf2a2" block="Ultrasonic"
-namespace ultrasonic {
-    /**
-     * Units for distance.
-     */
-    export enum Unit {
-        //% block="cm"
-        Centimeters = 0,
-        //% block="inch"
-        Inches = 1
-    }
+namespace ultrasonic33 {
+    export enum Unit { Centimeters = 0, Inches = 1 }
 
     let _trig: DigitalPin = DigitalPin.P1
-    let _echo: DigitalPin = DigitalPin.P0
-    let _maxUs = 25000 // ~4.3m round-trip timeout in microseconds
-    let _polling = false
+    let _echo: DigitalPin = DigitalPin.P2
+    // Push timeouts higher because at 3.3 V the front-end is slow
+    let _maxUs = 40000 // up to ~6.9 m round-trip
+    let _settleUs = 600 // time after trigger to let the module settle
 
-    /**
-     * Select the trigger and echo pins
-     */
-    //% blockId=ultra_set_pins
-    //% block="set ultrasonic pins|TRIG %trig|ECHO %echo"
+    //% blockId=u33_setpins block="set ultrasonic pins TRIG %trig ECHO %echo"
     //% trig.defl=DigitalPin.P1 echo.defl=DigitalPin.P2
-    //% weight=90
-    export function setPins(trig: DigitalPin, echo: DigitalPin): void {
-        _trig = trig
-        _echo = echo
+    export function setPins(trig: DigitalPin, echo: DigitalPin) {
+        _trig = trig; _echo = echo
         pins.setPull(_echo, PinPullMode.PullNone)
-        // make sure trigger is low initially
         pins.digitalWritePin(_trig, 0)
-        control.waitMicros(5)
+        basic.pause(10)
     }
 
-    /**
-     * Set the maximum measurable distance (timeout)
-     * (e.g., 25,000µs ≈ 4.3m; 12,000µs ≈ ~2m)
-     */
-    //% blockId=ultra_set_timeout
-    //% block="set ultrasonic max time %maxMicros µs"
-    //% maxMicros.min=3000 maxMicros.max=40000 maxMicros.defl=25000
+    //% blockId=u33_settimeouts block="set ultrasonic max time %maxMicros µs and settle %settleMicros µs"
+    //% maxMicros.min=15000 maxMicros.max=60000 maxMicros.defl=40000
+    //% settleMicros.min=100 settleMicros.max=2000 settleMicros.defl=600
     //% group="Advanced"
-    //% weight=10
-    export function setMaxMicros(maxMicros: number): void {
-        _maxUs = Math.max(3000, Math.min(40000, maxMicros | 0))
+    export function setTiming(maxMicros: number, settleMicros: number) {
+        _maxUs = Math.max(15000, Math.min(60000, maxMicros | 0))
+        _settleUs = Math.max(100, Math.min(2000, settleMicros | 0))
     }
 
-    /**
-     * Read distance once in centimeters.
-     */
-    //% blockId=ultra_read_cm_once
-    //% block="ultrasonic distance (cm)"
-    //% weight=85
-    export function distanceCm(): number {
-        return read(Unit.Centimeters, 1)
-    }
-
-    /**
-     * Read distance with optional averaging and units.
-     */
-    //% blockId=ultra_read
-    //% block="ultrasonic distance in %unit averaging %samples samples"
-    //% samples.min=1 samples.max=10 samples.defl=3
-    //% weight=80
-    export function read(unit: Unit = Unit.Centimeters, samples: number = 3): number {
-        samples = Math.max(1, Math.min(10, samples | 0))
-        let sum = 0
-        let cnt = 0
+    //% blockId=u33_distance block="ultrasonic distance in %unit averaging %samples samples"
+    //% samples.min=1 samples.max=9 samples.defl=5
+    export function distance(unit: Unit = Unit.Centimeters, samples = 5): number {
+        const vals: number[] = []
         for (let i = 0; i < samples; i++) {
-            const cm = measureOnceCm()
-            if (cm > 0) {
-                sum += cm
-                cnt++
-            }
-            basic.pause(10)
+            const cm = measureOnceCmRobust()
+            if (cm > 0) vals.push(cm)
+            basic.pause(20)
         }
-        let cmAvg = cnt > 0 ? sum / cnt : 0
-        if (unit == Unit.Inches) return cmAvg / 2.54
-        return cmAvg
+        if (vals.length === 0) return 0
+        // median is more stable with occasional zeros
+        vals.sort((a, b) => a - b)
+        const med = vals[vals.length >> 1]
+        return unit === Unit.Inches ? med / 2.54 : med
     }
 
-    /**
-     * Fire a tiny 10µs trigger, measure echo high pulse, convert to cm.
-     * HC-SR04: distance(cm) ≈ duration(µs) / 58
-     */
-    function measureOnceCm(): number {
-        // ensure clean low
+    // Try hard to get a reading at 3.3 V
+    function measureOnceCmRobust(): number {
+        // a) pre-condition line low
         pins.digitalWritePin(_trig, 0)
-        control.waitMicros(2)
+        control.waitMicros(4)
 
-        // 10µs HIGH pulse on TRIG
+        // b) stronger/longer trigger (30 µs)
         pins.digitalWritePin(_trig, 1)
-        control.waitMicros(10)
+        control.waitMicros(30)
         pins.digitalWritePin(_trig, 0)
 
-        // measure ECHO high time (round-trip)
-        const d = pins.pulseIn(_echo, PulseValue.High, _maxUs)
-        if (d <= 0) return 0
+        // c) allow internal comparator/transducer to wake up
+        control.waitMicros(_settleUs)
 
-        // convert to cm; 58 is standard factor for HC-SR04
-        const cm = d / 58
-        return cm
-    }
-
-    /**
-     * Run code when distance (in cm) is less than a threshold.
-     * Uses a background poll (~every 50ms).
-     */
-    //% blockId=ultra_on_less
-    //% block="on ultrasonic < %threshold cm"
-    //% threshold.min=2 threshold.max=400 threshold.defl=10
-    //% draggableParameters="reporter"
-    //% weight=70
-    export function onDistanceLessThan(threshold: number, handler: (currentCm: number) => void): void {
-        threshold = Math.max(2, Math.min(400, threshold | 0))
-        if (_polling) {
-            // already polling — just add another handler
-            control.inBackground(() => {
-                while (true) {
-                    const cm = distanceCm()
-                    if (cm > 0 && cm < threshold) handler(cm)
-                    basic.pause(50)
-                }
-            })
-            return
+        // d) attempt 1: normal HIGH pulse (most modules)
+        let dur = pins.pulseIn(_echo, PulseValue.High, _maxUs)
+        if (dur <= 0) {
+            // e) attempt 2: some clones expose a LOW pulse instead
+            dur = pins.pulseIn(_echo, PulseValue.Low, _maxUs)
         }
-        _polling = true
-        control.inBackground(() => {
-            while (true) {
-                const cm = distanceCm()
-                if (cm > 0 && cm < threshold) handler(cm)
-                basic.pause(50)
-            }
-        })
+        if (dur <= 0) {
+            // f) attempt 3: quick re-trigger (double-ping helps some units)
+            control.waitMicros(200)
+            pins.digitalWritePin(_trig, 1)
+            control.waitMicros(20)
+            pins.digitalWritePin(_trig, 0)
+            control.waitMicros(_settleUs)
+            dur = pins.pulseIn(_echo, PulseValue.High, _maxUs)
+            if (dur <= 0) dur = pins.pulseIn(_echo, PulseValue.Low, _maxUs)
+        }
+        if (dur <= 0) return 0
+
+        // µs → cm (HC-SR04 ≈ d/58)
+        return dur / 58
     }
 }
